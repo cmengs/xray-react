@@ -3,61 +3,124 @@ package storage
 import (
 	"context"
 	"database/sql"
-	"errors"
+	"fmt"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-// Store defines the minimal storage functions the collector needs.
-type Store interface {
-	SaveEvent(ctx context.Context, payload string, connectionID string) error
-}
-
-// SQLiteStore implements Store backed by sqlite.
+// SQLiteStore is a simple SQLite-backed event store that uses prepared statements.
 type SQLiteStore struct {
-	db *sql.DB
+	db         *sql.DB
+	insertStmt *sql.Stmt
+	listStmt   *sql.Stmt
 }
 
-// NewSQLiteStore opens (or creates) a sqlite database file and ensures the
-// events table exists. Note: events table now includes connection_id column.
+// Event represents a stored event.
+type Event struct {
+	ID        int64     `json:"id"`
+	Type      string    `json:"type"`
+	Payload   string    `json:"payload"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+// NewSQLiteStore opens the database, creates tables if necessary, and prepares statements.
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite3", path)
+	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000")
 	if err != nil {
 		return nil, err
 	}
+	// Ensure foreign keys and pragmas
+	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"); err != nil {
+		// not fatal
+	}
 
-	// Create table with connection_id column
-	create := `CREATE TABLE IF NOT EXISTS events (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		payload TEXT NOT NULL,
-		connection_id TEXT,
-		created_at DATETIME NOT NULL
-	);`
+	// Create table if not exists
+	schema := `CREATE TABLE IF NOT EXISTS events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	type TEXT NOT NULL,
+	payload TEXT,
+	created_at DATETIME DEFAULT (STRFTIME('%Y-%m-%dT%H:%M:%fZ','now'))
+);`
+	if _, err := db.Exec(schema); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("failed to create schema: %w", err)
+	}
 
-	if _, err := db.Exec(create); err != nil {
+	ins, err := db.Prepare("INSERT INTO events(type,payload) VALUES(?, ?)")
+	if err != nil {
 		db.Close()
 		return nil, err
 	}
 
-	return &SQLiteStore{db: db}, nil
-}
-
-// SaveEvent stores an event payload and the associated connection_id.
-func (s *SQLiteStore) SaveEvent(ctx context.Context, payload string, connectionID string) error {
-	if s == nil || s.db == nil {
-		return errors.New("sqlite store not initialized")
+	// listStmt supports an optional type filter: (? = '' OR type = ?)
+	listQ := `SELECT id, type, payload, created_at FROM events
+	WHERE (? = '' OR type = ?)
+	ORDER BY id DESC
+	LIMIT ? OFFSET ?;`
+	list, err := db.Prepare(listQ)
+	if err != nil {
+		ins.Close()
+		db.Close()
+		return nil, err
 	}
 
-	stmt := `INSERT INTO events (payload, connection_id, created_at) VALUES (?, ?, ?)`
-	_, err := s.db.ExecContext(ctx, stmt, payload, connectionID, time.Now().UTC())
-	return err
+	return &SQLiteStore{db: db, insertStmt: ins, listStmt: list}, nil
 }
 
-// Close closes the underlying DB.
+// Close closes prepared statements and the underlying DB.
 func (s *SQLiteStore) Close() error {
-	if s == nil || s.db == nil {
-		return nil
+	if s.insertStmt != nil {
+		s.insertStmt.Close()
 	}
-	return s.db.Close()
+	if s.listStmt != nil {
+		s.listStmt.Close()
+	}
+	if s.db != nil {
+		return s.db.Close()
+	}
+	return nil
+}
+
+// InsertEvent inserts a new event using a prepared statement.
+func (s *SQLiteStore) InsertEvent(ctx context.Context, typ, payload string) (int64, error) {
+	res, err := s.insertStmt.ExecContext(ctx, typ, payload)
+	if err != nil {
+		return 0, err
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		return 0, err
+	}
+	return id, nil
+}
+
+// ListEvents returns events with optional type filtering and pagination (limit, offset).
+func (s *SQLiteStore) ListEvents(ctx context.Context, typ string, limit, offset int) ([]Event, error) {
+	if typ == "" {
+		// for prepared statement, pass empty string to match all
+	}
+	rows, err := s.listStmt.QueryContext(ctx, typ, typ, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var out []Event
+	for rows.Next() {
+		var e Event
+		var createdStr string
+		if err := rows.Scan(&e.ID, &e.Type, &e.Payload, &createdStr); err != nil {
+			return nil, err
+		}
+		// try to parse createdStr; if parse fails, leave zero value
+		if t, err := time.Parse("2006-01-02T15:04:05.999Z", createdStr); err == nil {
+			e.CreatedAt = t
+		}
+		out = append(out, e)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return out, nil
 }

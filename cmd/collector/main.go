@@ -2,123 +2,97 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	_ "fmt"
 	"log"
 	"net/http"
 	"os"
-	"strings"
+	"strconv"
+	_ "time"
 
-	"github.com/google/uuid"
-	"github.com/cmengs/xray-react/internal/collector"
-	"github.com/cmengs/xray-react/internal/storage"
+	"github.com/cmengs/xray-react/collector/internal/storage"
 )
 
 func main() {
-	// Read config from env
-	token := os.Getenv("COLLECTOR_API_TOKEN")
-	if token == "" {
-		log.Println("Warning: COLLECTOR_API_TOKEN not set — collector will allow unauthenticated traffic for protected routes")
+	ctx := context.Background()
+	dbPath := os.Getenv("COLLECTOR_DB_PATH")
+	if dbPath == "" {
+		dbPath = "data/collector.db"
 	}
 
-	// Initialize storage
-	store, err := storage.NewSQLiteStore("./collector.db")
+	store, err := storage.NewSQLiteStore(dbPath)
 	if err != nil {
-		log.Fatalf("failed to open sqlite store: %v", err)
+		log.Fatalf("failed to open store: %v", err)
 	}
+	defer store.Close()
 
-	col := collector.NewCollector(store)
-
-	mux := http.NewServeMux()
-
-	// Ingest handler — each inbound request gets a connection_id and events saved with it
-	mux.HandleFunc("/ingest", func(w http.ResponseWriter, r *http.Request) {
-		ctx := r.Context()
-		connectionID := uuid.New().String()
-		// track active connection
-		col.AddConnection(connectionID)
-		defer col.RemoveConnection(connectionID)
-
-		// read payload
-		payload := ""
-		if r.ContentLength > 0 {
-			buf := make([]byte, r.ContentLength)
-			_, _ = r.Body.Read(buf)
-			payload = string(buf)
+	http.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		switch r.Method {
+		case "POST":
+			handlePost(ctx, store, w, r)
+		case "GET":
+			handleList(ctx, store, w, r)
+		default:
+			w.WriteHeader(http.StatusMethodNotAllowed)
 		}
-
-		// save the event along with connection id
-		if err := col.SaveEvent(ctx, payload, connectionID); err != nil {
-			http.Error(w, "failed to save event", http.StatusInternalServerError)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		w.Header().Set("X-Connection-Id", connectionID)
-		w.Write([]byte(`{"status":"ok"}`))
 	})
-
-	// Simple API route to check active connections
-	mux.HandleFunc("/api/active_connections", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		count := col.ActiveConnectionsCount()
-		w.Write([]byte(`{"active_connections":` + string(intToBytes(count)) + `}`))
-	})
-
-	// Wrap mux with scoped token middleware — only protect ingest and /api routes
-	protectedPrefixes := []string{"/ingest", "/api"}
-	handler := ScopedTokenMiddleware(token, protectedPrefixes)(mux)
 
 	addr := ":8080"
 	log.Printf("collector listening on %s", addr)
-	if err := http.ListenAndServe(addr, handler); err != nil {
-		log.Fatalf("server error: %v", err)
-	}
+	log.Fatal(http.ListenAndServe(addr, nil))
 }
 
-// ScopedTokenMiddleware returns middleware that enforces a bearer token only
-// for requests whose path matches one of the provided prefixes. If token is
-// empty the middleware allows requests (useful for local/dev).
-func ScopedTokenMiddleware(token string, protectedPrefixes []string) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// If token not configured, allow everything
-			if token == "" {
-				next.ServeHTTP(w, r)
-				return
-			}
-
-			// Check if path needs protection
-			for _, p := range protectedPrefixes {
-				if strings.HasPrefix(r.URL.Path, p) {
-					auth := r.Header.Get("Authorization")
-					if !strings.HasPrefix(auth, "Bearer ") {
-						http.Error(w, "unauthorized", http.StatusUnauthorized)
-						return
-					}
-					provided := strings.TrimPrefix(auth, "Bearer ")
-					if provided != token {
-						http.Error(w, "forbidden", http.StatusForbidden)
-						return
-					}
-					break
-				}
-			}
-
-			next.ServeHTTP(w, r)
-		})
+func handlePost(ctx context.Context, s *storage.SQLiteStore, w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Type    string `json:"type"`
+		Payload string `json:"payload"`
 	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid json: "+err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Type == "" {
+		req.Type = "default"
+	}
+	id, err := s.InsertEvent(ctx, req.Type, req.Payload)
+	if err != nil {
+		http.Error(w, "insert failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]interface{}{"id": id})
 }
 
-// intToBytes converts a small int to its ASCII bytes (very small helper to avoid imports)
-func intToBytes(i int) []byte {
-	// supports only non-negative small ints
-	if i == 0 {
-		return []byte("0")
+func handleList(ctx context.Context, s *storage.SQLiteStore, w http.ResponseWriter, r *http.Request) {
+	q := r.URL.Query()
+	typ := q.Get("type")
+	pageStr := q.Get("page")
+	perPageStr := q.Get("per_page")
+
+	page := 1
+	perPage := 25
+	if pageStr != "" {
+		if p, err := strconv.Atoi(pageStr); err == nil && p > 0 {
+			page = p
+		}
 	}
-	buf := make([]byte, 0, 4)
-	for i > 0 {
-		d := i % 10
-		buf = append([]byte{byte('0' + d)}, buf...)
-		i = i / 10
+	if perPageStr != "" {
+		if pp, err := strconv.Atoi(perPageStr); err == nil && pp > 0 {
+			perPage = pp
+		}
 	}
-	return buf
+	offset := (page - 1) * perPage
+
+	list, err := s.ListEvents(ctx, typ, perPage, offset)
+	if err != nil {
+		http.Error(w, "list failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"page":     page,
+		"per_page": perPage,
+		"items":    list,
+	})
 }
