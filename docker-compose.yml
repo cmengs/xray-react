@@ -1,0 +1,14 @@
+version: "3.8"
+services:
+  collector:
+    build: .
+    image: xray-react-collector:latest
+    environment:
+      - LISTEN_ADDR=:8080
+      # Optional API token; set to secure value to require X-API-Key header on /ingest
+      - API_TOKEN=changeme123
+      - COLLECTOR_DB=/data/events.db
+    volumes:
+      - ./data:/data
+    ports:
+      - "8080:8080"
