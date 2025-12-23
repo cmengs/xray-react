@@ -1,0 +1,156 @@
+From fc3b8e0000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Copilot <copilot@example.com>
+Date: Tue, 23 Dec 2025 00:00:00 +0000
+Subject: [PATCH] switch sqlite driver to github.com/glebarez/go-sqlite (pure-Go, no CGO)
+
+---
+ go.mod                                      | 6 +++---
+ internal/storage/sqlite.go                  | 30 ++++++++++++++++++++++++++++++
+ 2 files changed, 33 insertions(+), 3 deletions(-)
+
+diff --git a/go.mod b/go.mod
+index 0000000..1111111 100644
+--- a/go.mod
++++ b/go.mod
+@@ -1,9 +1,9 @@
+ module github.com/cmengs/xray-react/collector
+
+ go 1.20
+
+ require (
+-	github.com/gin-gonic/gin v1.9.0
+-	github.com/mattn/go-sqlite3 v1.16.0
+-	github.com/prometheus/client_golang v1.16.0
++	github.com/gin-gonic/gin v1.9.0
++	github.com/glebarez/go-sqlite v0.4.0
++	github.com/prometheus/client_golang v1.16.0
+ )
+
+diff --git a/internal/storage/sqlite.go b/internal/storage/sqlite.go
+index 2222222..3333333 100644
+--- a/internal/storage/sqlite.go
++++ b/internal/storage/sqlite.go
+@@ -1,56 +1,83 @@
+ package storage
+
+ import (
+ 	"database/sql"
+ 	"encoding/json"
+ 	"time"
+
+-	_ "github.com/mattn/go-sqlite3"
++	_ "github.com/glebarez/go-sqlite" // pure-Go sqlite driver (no CGO), works well on Windows
+ )
+
+ type ConnectionEvent struct {
+ 	ID         int64                  `json:"id"`
+ 	Timestamp  time.Time              `json:"timestamp"`
+ 	SrcIP      string                 `json:"src_ip"`
+ 	SrcPort    int                    `json:"src_port"`
+ 	DstIP      string                 `json:"dst_ip"`
+ 	DstPort    int                    `json:"dst_port"`
+ 	Protocol   string                 `json:"protocol"`
+ 	User       string                 `json:"user,omitempty"`
+ 	BytesUp    int64                  `json:"bytes_up,omitempty"`
+ 	BytesDown  int64                  `json:"bytes_down,omitempty"`
+ 	Status     string                 `json:"status,omitempty"`
+ 	Reason     string                 `json:"reason,omitempty"`
+ 	DurationMs int64                  `json:"duration_ms,omitempty"`
+ 	Meta       map[string]interface{} `json:"meta,omitempty"`
+ }
+
+ type Store interface {
+ 	Insert(ConnectionEvent) error
+ 	ListRecent(limit int) ([]ConnectionEvent, error)
+ 	Close() error
+ }
+
+ type SQLiteStore struct {
+ 	db *sql.DB
+ }
+
+ func NewSQLiteStore(path string) (*SQLiteStore, error) {
+-	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000&_journal_mode=WAL")
++	// Using "sqlite" driver name from github.com/glebarez/go-sqlite (pure-Go)
++	db, err := sql.Open("sqlite", path)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	s := &SQLiteStore{db: db}
++	// Configure PRAGMA to mimic previous DSN options (busy_timeout and WAL mode)
++	// These make the DB more robust under concurrent writes.
++	_, _ = db.Exec("PRAGMA busy_timeout = 5000;")
++	_, _ = db.Exec("PRAGMA journal_mode = WAL;")
++
++	s := &SQLiteStore{db: db}
+ 	if err := s.init(); err != nil {
+ 		return nil, err
+ 	}
+ 	return s, nil
+ }
+
+ func (s *SQLiteStore) init() error {
+ 	schema := `
+ CREATE TABLE IF NOT EXISTS connection_events (
+ 	id INTEGER PRIMARY KEY AUTOINCREMENT,
+ 	timestamp DATETIME,
+ 	src_ip TEXT,
+ 	src_port INTEGER,
+ 	dst_ip TEXT,
+ 	dst_port INTEGER,
+ 	protocol TEXT,
+ 	user TEXT,
+ 	bytes_up INTEGER,
+ 	bytes_down INTEGER,
+ 	status TEXT,
+ 	reason TEXT,
+ 	duration_ms INTEGER,
+ 	meta TEXT
+ );
+ CREATE INDEX IF NOT EXISTS idx_ts ON connection_events(timestamp);
+ `
+ 	_, err := s.db.Exec(schema)
+ 	return err
+ }
+
+ func (s *SQLiteStore) Insert(ev ConnectionEvent) error {
+ 	metaBytes, _ := json.Marshal(ev.Meta)
+ 	_, err := s.db.Exec(
+ 		`INSERT INTO connection_events(timestamp, src_ip, src_port, dst_ip, dst_port, protocol, user, bytes_up, bytes_down, status, reason, duration_ms, meta)
+ 		VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+ 		ev.Timestamp, ev.SrcIP, ev.SrcPort, ev.DstIP, ev.DstPort, ev.Protocol, ev.User, ev.BytesUp, ev.BytesDown, ev.Status, ev.Reason, ev.DurationMs, string(metaBytes),
+ 	)
+ 	return err
+ }
+
+ func (s *SQLiteStore) ListRecent(limit int) ([]ConnectionEvent, error) {
+ 	rows, err := s.db.Query(`SELECT id, timestamp, src_ip, src_port, dst_ip, dst_port, protocol, user, bytes_up, bytes_down, status, reason, duration_ms, meta
+ 		FROM connection_events ORDER BY timestamp DESC LIMIT ?`, limit)
+ 	if err != nil {
+ 		return nil, err
+ 	}
+ 	defer rows.Close()
+ 	var out []ConnectionEvent
+ 	for rows.Next() {
+ 		var ev ConnectionEvent
+ 		var metaText sql.NullString
+ 		var ts time.Time
+ 		if err := rows.Scan(&ev.ID, &ts, &ev.SrcIP, &ev.SrcPort, &ev.DstIP, &ev.DstPort, &ev.Protocol, &ev.User, &ev.BytesUp, &ev.BytesDown, &ev.Status, &ev.Reason, &ev.DurationMs, &metaText); err != nil {
+ 			return nil, err
+ 		}
+ 		ev.Timestamp = ts
+ 		if metaText.Valid && metaText.String != "" {
+ 			var m map[string]interface{}
+ 			_ = json.Unmarshal([]byte(metaText.String), &m)
+ 			ev.Meta = m
+ 		}
+ 		out = append(out, ev)
+ 	}
+ 	return out, nil
+ }
+
+ func (s *SQLiteStore) Close() error {
+ 	return s.db.Close()
+ }
+--
+2.39.2
