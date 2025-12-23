@@ -1,84 +1,124 @@
 package main
 
 import (
+	"context"
 	"log"
 	"net/http"
 	"os"
-	"time"
+	"strings"
 
-	"github.com/cmengs/xray-react/collector/internal/collector"
-	"github.com/cmengs/xray-react/collector/internal/storage"
-	"github.com/gin-gonic/gin"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/google/uuid"
+	"github.com/cmengs/xray-react/internal/collector"
+	"github.com/cmengs/xray-react/internal/storage"
 )
 
 func main() {
-	// 初始化存储（SQLite PoC）
-	dbPath := os.Getenv("COLLECTOR_DB")
-	if dbPath == "" {
-		dbPath = "events.db"
+	// Read config from env
+	token := os.Getenv("COLLECTOR_API_TOKEN")
+	if token == "" {
+		log.Println("Warning: COLLECTOR_API_TOKEN not set — collector will allow unauthenticated traffic for protected routes")
 	}
-	store, err := storage.NewSQLiteStore(dbPath)
+
+	// Initialize storage
+	store, err := storage.NewSQLiteStore("./collector.db")
 	if err != nil {
-		log.Fatalf("failed init sqlite: %v", err)
+		log.Fatalf("failed to open sqlite store: %v", err)
 	}
-	defer store.Close()
 
 	col := collector.NewCollector(store)
 
-	r := gin.Default()
+	mux := http.NewServeMux()
 
-	// Optional simple API token: set API_TOKEN env to enable.
-	apiToken := os.Getenv("API_TOKEN")
-	if apiToken != "" {
-		// middleware to require X-API-Key header
-		r.Use(func(c *gin.Context) {
-			key := c.GetHeader("X-API-Key")
-			if key == "" || key != apiToken {
-				c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "unauthorized"})
-				return
-			}
-			c.Next()
-		})
-	}
+	// Ingest handler — each inbound request gets a connection_id and events saved with it
+	mux.HandleFunc("/ingest", func(w http.ResponseWriter, r *http.Request) {
+		ctx := r.Context()
+		connectionID := uuid.New().String()
+		// track active connection
+		col.AddConnection(connectionID)
+		defer col.RemoveConnection(connectionID)
 
-	// Ingest endpoint: singbox/xray 或 agent 将连接事件以 JSON POST 到这里
-	r.POST("/ingest", func(c *gin.Context) {
-		if err := col.HandleIngest(c.Request, c.Writer); err != nil {
-			// HandleIngest 已经写入 response on success
-			// 如果这里返回，表示有错误
-			c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		// read payload
+		payload := ""
+		if r.ContentLength > 0 {
+			buf := make([]byte, r.ContentLength)
+			_, _ = r.Body.Read(buf)
+			payload = string(buf)
 		}
-	})
 
-	// Simple API to query recent connections (PoC)
-	r.GET("/api/v1/connections", func(c *gin.Context) {
-		limit := 100
-		events, err := store.ListRecent(limit)
-		if err != nil {
-			c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		// save the event along with connection id
+		if err := col.SaveEvent(ctx, payload, connectionID); err != nil {
+			http.Error(w, "failed to save event", http.StatusInternalServerError)
 			return
 		}
-		c.JSON(http.StatusOK, events)
+
+		w.Header().Set("Content-Type", "application/json")
+		w.Header().Set("X-Connection-Id", connectionID)
+		w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	// Prometheus metrics
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
+	// Simple API route to check active connections
+	mux.HandleFunc("/api/active_connections", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		count := col.ActiveConnectionsCount()
+		w.Write([]byte(`{"active_connections":` + string(intToBytes(count)) + `}`))
+	})
+
+	// Wrap mux with scoped token middleware — only protect ingest and /api routes
+	protectedPrefixes := []string{"/ingest", "/api"}
+	handler := ScopedTokenMiddleware(token, protectedPrefixes)(mux)
 
 	addr := ":8080"
-	if a := os.Getenv("LISTEN_ADDR"); a != "" {
-		addr = a
-	}
-
-	srv := &http.Server{
-		Addr:         addr,
-		Handler:      r,
-		ReadTimeout:  10 * time.Second,
-		WriteTimeout: 30 * time.Second,
-	}
-
-	log.Printf("collector listening on %s", srv.Addr)
-	if err := srv.ListenAndServe(); err != nil {
+	log.Printf("collector listening on %s", addr)
+	if err := http.ListenAndServe(addr, handler); err != nil {
 		log.Fatalf("server error: %v", err)
 	}
+}
+
+// ScopedTokenMiddleware returns middleware that enforces a bearer token only
+// for requests whose path matches one of the provided prefixes. If token is
+// empty the middleware allows requests (useful for local/dev).
+func ScopedTokenMiddleware(token string, protectedPrefixes []string) func(http.Handler) http.Handler {
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// If token not configured, allow everything
+			if token == "" {
+				next.ServeHTTP(w, r)
+				return
+			}
+
+			// Check if path needs protection
+			for _, p := range protectedPrefixes {
+				if strings.HasPrefix(r.URL.Path, p) {
+					auth := r.Header.Get("Authorization")
+					if !strings.HasPrefix(auth, "Bearer ") {
+						http.Error(w, "unauthorized", http.StatusUnauthorized)
+						return
+					}
+					provided := strings.TrimPrefix(auth, "Bearer ")
+					if provided != token {
+						http.Error(w, "forbidden", http.StatusForbidden)
+						return
+					}
+					break
+				}
+			}
+
+			next.ServeHTTP(w, r)
+		})
+	}
+}
+
+// intToBytes converts a small int to its ASCII bytes (very small helper to avoid imports)
+func intToBytes(i int) []byte {
+	// supports only non-negative small ints
+	if i == 0 {
+		return []byte("0")
+	}
+	buf := make([]byte, 0, 4)
+	for i > 0 {
+		d := i % 10
+		buf = append([]byte{byte('0' + d)}, buf...)
+		i = i / 10
+	}
+	return buf
 }
