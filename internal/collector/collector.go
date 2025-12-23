@@ -2,25 +2,23 @@ package collector
 
 import (
 	"context"
-	"errors"
 	"sync"
 	"time"
 
-	"github.com/cmengs/xray-react/internal/storage"
+	"github.com/cmengs/xray-react/collector/internal/storage"
 )
 
 // Collector is responsible for accepting events and forwarding them to storage.
 // It also tracks active connections using a mutex-protected map; each connection
 // is identified by a connection_id (string).
 type Collector struct {
-	store storage.Store
+	store *storage.SQLiteStore
 
 	mu                sync.Mutex
 	activeConnections map[string]time.Time
 }
 
-// NewCollector constructs a new Collector.
-func NewCollector(s storage.Store) *Collector {
+func NewCollector(s *storage.SQLiteStore) *Collector {
 	return &Collector{
 		store:             s,
 		activeConnections: make(map[string]time.Time),
@@ -50,9 +48,10 @@ func (c *Collector) ActiveConnectionsCount() int {
 
 // SaveEvent persists an event payload to the configured storage and associates it
 // with the provided connection_id.
-func (c *Collector) SaveEvent(ctx context.Context, payload string, connectionID string) error {
-	if c.store == nil {
-		return errors.New("no storage configured")
+func (c *Collector) SaveEvent(ctx context.Context, payload, connectionID string) error {
+	count, err := c.store.InsertEvent(ctx, payload, connectionID)
+	if count == 0 {
+		return err
 	}
-	return c.store.SaveEvent(ctx, payload, connectionID)
+	return err
 }
