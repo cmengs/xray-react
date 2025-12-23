@@ -5,6 +5,7 @@ go 1.20
 require (
 	github.com/gin-gonic/gin v1.9.0
 	github.com/glebarez/go-sqlite v1.22.0
+	github.com/mattn/go-sqlite3 v1.14.16
 	github.com/prometheus/client_golang v1.16.0
 )
 
