@@ -17,7 +17,7 @@ func main() {
 	ctx := context.Background()
 	dbPath := os.Getenv("COLLECTOR_DB_PATH")
 	if dbPath == "" {
-		dbPath = "data/collector.db"
+		dbPath = "./data/collector.db"
 	}
 
 	store, err := storage.NewSQLiteStore(dbPath)

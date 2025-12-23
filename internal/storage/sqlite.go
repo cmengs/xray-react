@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"time"
 
-	_ "github.com/mattn/go-sqlite3"
+	_ "modernc.org/sqlite"
 )
 
 // SQLiteStore is a simple SQLite-backed event store that uses prepared statements.
@@ -26,14 +26,13 @@ type Event struct {
 
 // NewSQLiteStore opens the database, creates tables if necessary, and prepares statements.
 func NewSQLiteStore(path string) (*SQLiteStore, error) {
-	db, err := sql.Open("sqlite3", path+"?_busy_timeout=5000")
+	db, err := sql.Open("sqlite", path)
 	if err != nil {
 		return nil, err
 	}
-	// Ensure foreign keys and pragmas
-	if _, err := db.Exec("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"); err != nil {
-		// not fatal
-	}
+	// set pragmas similar to DSN params used previously
+	_, _ = db.Exec("PRAGMA busy_timeout = 5000;")
+	_, _ = db.Exec("PRAGMA journal_mode = WAL;")
 
 	// Create table if not exists
 	schema := `CREATE TABLE IF NOT EXISTS events (
@@ -65,7 +64,13 @@ func NewSQLiteStore(path string) (*SQLiteStore, error) {
 		return nil, err
 	}
 
-	return &SQLiteStore{db: db, insertStmt: ins, listStmt: list}, nil
+	// assemble store
+	s := &SQLiteStore{
+		db:         db,
+		insertStmt: ins,
+		listStmt:   list,
+	}
+	return s, nil
 }
 
 // Close closes prepared statements and the underlying DB.
